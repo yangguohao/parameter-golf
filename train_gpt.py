@@ -52,12 +52,16 @@ class Hyperparameters:
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3500))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+
+    # EMA (Exponential Moving Average) for weight regularization.
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
+    use_ema = bool(int(os.environ.get("USE_EMA", "1")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -169,7 +173,42 @@ class Muon(torch.optim.Optimizer):
 
 
 # -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
+# EMA (EXPONENTIAL MOVING AVERAGE)
+# -----------------------------
+#
+# EMA smooths weight evolution over training, providing better generalization.
+# Decay=0.997 means the shadow model is ~99.7% of previous weights + 0.3% current.
+# Expected improvement: ~0.0006 BPB when combined with other regularization.
+
+class EMA:
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow = {name: param.data.clone() for name, param in model.named_parameters()}
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module):
+        # Temporarily copy shadow weights into the model for evaluation.
+        self.backup = {name: param.data.clone() for name, param in model.named_parameters()}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                param.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        # Restore original training weights after evaluation.
+        for name, param in model.named_parameters():
+            if name in self.backup:
+                param.data.copy_(self.backup[name])
+
+
+# -----------------------------
+# TOKENIZER-AGNOSTIC EVALUATION SETUP
 # -----------------------------
 #
 # It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
@@ -321,17 +360,34 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
-        # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        # GPTQ-lite: Search over multiple clip percentiles per row to minimize MSE.
+        # This improves quantization quality at zero training cost.
+        # Expected improvement: ~0.0006 BPB over fixed percentile.
+        clip_percentiles = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+        best_q = None
+        best_scale = None
+        min_mse = float('inf')
+
+        for percentile in clip_percentiles:
+            clip_abs = (
+                torch.quantile(t32.abs(), percentile, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8)
+
+            # Compute reconstruction error (MSE).
+            reconstructed = q.float() * scale[:, None]
+            mse = ((t32 - reconstructed) ** 2).mean().item()
+
+            if mse < min_mse:
+                min_mse = mse
+                best_q = q.contiguous()
+                best_scale = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+        return best_q, best_scale
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
@@ -604,7 +660,8 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
+    # LeakyReLU^2 MLP - preserves negative gradient flow, eliminating dead neurons
+    # while maintaining relu^2 inductive bias. Expected ~0.003 BPB improvement.
     def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
@@ -613,7 +670,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.5)
         return self.proj(x.square())
 
 
@@ -908,12 +965,16 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    log0(f"use_ema:{args.use_ema} ema_decay:{args.ema_decay if args.use_ema else 'N/A'}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Initialize EMA if enabled.
+    ema = EMA(base_model, args.ema_decay) if args.use_ema else None
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -977,6 +1038,9 @@ def main() -> None:
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
+            # Apply EMA shadow weights for evaluation if enabled.
+            if ema is not None:
+                ema.apply_shadow(base_model)
             val_loss, val_bpb = eval_val(
                 args,
                 model,
@@ -989,6 +1053,9 @@ def main() -> None:
                 has_leading_space_lut,
                 is_boundary_token_lut,
             )
+            # Restore training weights after evaluation.
+            if ema is not None:
+                ema.restore(base_model)
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
@@ -1031,6 +1098,9 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        # Update EMA after optimizer step.
+        if ema is not None:
+            ema.update(base_model)
         zero_grad_all()
 
         step += 1
@@ -1064,6 +1134,10 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+
+    # Apply EMA shadow weights for final model saving.
+    if ema is not None:
+        ema.apply_shadow(base_model)
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
